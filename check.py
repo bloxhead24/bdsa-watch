@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import sys
+import time
 import urllib.request
 
 EVENT_URL = os.environ.get("BDSA_URL", "https://www.tickettailor.com/events/britishdentalstudentsassociation/2371111")
@@ -119,6 +120,19 @@ def main():
     if "--test-alert" in sys.argv:
         notify("BDSA watcher test", "Tap to open the ticket page. If you see this, alerts work.", "high")
         return
+    # --loop N: keep checking every INTERVAL seconds for N seconds (one long job instead of relying on cron)
+    if "--loop" in sys.argv:
+        end = time.time() + int(sys.argv[sys.argv.index("--loop") + 1])
+        interval = int(os.environ.get("INTERVAL", "60"))
+        while True:
+            check_once()
+            if time.time() + interval >= end:
+                return
+            time.sleep(interval)
+    check_once()
+
+
+def check_once():
     state = load() or {}
     try:
         cur = snapshot(fetch(EVENT_URL))
@@ -131,7 +145,7 @@ def main():
             sys.exit(f"{fails} failed checks in a row: watcher can't read the page")
         return
     prev = state.get("snap")
-    print("current:", summary(cur), "|", json.dumps(cur), flush=True)
+    print(time.strftime("%H:%M:%S"), "current:", summary(cur), "|", " ".join(cur["release"]), flush=True)
     if "--dry-run" in sys.argv:
         return
     if prev is not None:

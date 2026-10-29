@@ -1,7 +1,7 @@
 name: BDSA ticket watch
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       test_alert:
@@ -9,17 +9,36 @@ on:
         type: boolean
         default: false
 
+# One watcher at a time. Each run checks every 60s for ~5h45m, so a late or
+# skipped cron trigger no longer leaves a gap: the next trigger queues behind it.
+concurrency:
+  group: bdsa-watch
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: .state
           key: bdsa-state-${{ github.run_id }}
           restore-keys: bdsa-state-
-      - run: python3 check.py ${{ inputs.test_alert && '--test-alert' || '' }}
+      - name: Test alert
+        if: ${{ inputs.test_alert }}
+        run: python3 check.py --test-alert
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      - name: Watch
+        if: ${{ !inputs.test_alert }}
+        run: python3 check.py --loop 20700
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          INTERVAL: "60"
+      - uses: actions/cache/save@v4
+        if: always() && !inputs.test_alert
+        with:
+          path: .state
+          key: bdsa-state-${{ github.run_id }}
