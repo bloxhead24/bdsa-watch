@@ -1,0 +1,19 @@
+name: inspect page
+on: workflow_dispatch
+jobs:
+  i:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          UA="Mozilla/5.0 (personal ticket alert)"
+          for u in https://www.tickettailor.com/events/britishdentalstudentsassociation/2371111 https://www.tickettailor.com/events/britishdentalstudentsassociation; do
+            echo "===== $u"; curl -sSL -A "$UA" "$u" -o p.html -w "HTTP %{http_code} %{size_download}\n"
+            python3 - <<'PY'
+          import re
+          h=open('p.html').read()
+          for m in re.findall(r'<script[^>]*ld\+json[^>]*>(.*?)</script>',h,re.S): print("LDJSON:",m.strip()[:1500])
+          for m in re.finditer(r'(?i)(sold.?out|availab|in.?stock|remaining|on.?sale|select tickets|buy tickets|waitlist|data-[a-z-]*(?:status|stock|avail)[a-z-]*="[^"]*")',h):
+              s=h[max(0,m.start()-160):m.end()+160].replace("\n"," ")
+              print("CTX:",re.sub(r'\s+',' ',s))
+          PY
+          done
