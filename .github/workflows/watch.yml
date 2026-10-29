@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: Send a test push to my phone
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -15,6 +20,6 @@ jobs:
           path: .state
           key: bdsa-state-${{ github.run_id }}
           restore-keys: bdsa-state-
-      - run: python3 check.py
+      - run: python3 check.py ${{ inputs.test_alert && '--test-alert' || '' }}
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
