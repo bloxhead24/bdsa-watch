@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""BDSA ticket watcher. Alerts your phone (ntfy) when the release/sold-out wording on the event page changes.
-Alert-only: it never buys, fills forms, or touches the checkout widget (Ticket Tailor's robots.txt blocks it)."""
+"""BDSA ticket watcher. Pushes to your phone (ntfy) when ticket stock or the release wording changes.
+
+Reads the public event page only (allowed by Ticket Tailor's robots.txt). Its schema.org data lists
+every ticket type with availability (InStock / SoldOut), so restocks are caught even if the text
+never changes. Alert-only: never buys, fills forms, or touches the checkout widget.
+"""
 import html
+import json
 import os
 import pathlib
 import re
@@ -10,16 +15,15 @@ import urllib.request
 
 EVENT_URL = os.environ.get("BDSA_URL", "https://www.tickettailor.com/events/britishdentalstudentsassociation/2371111")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-STATE_FILE = pathlib.Path(os.environ.get("STATE_FILE", ".state/last"))
+STATE_FILE = pathlib.Path(os.environ.get("STATE_FILE", ".state/last.json"))
+FAIL_LIMIT = 3  # consecutive fetch failures before the run fails (GitHub then emails you)
 UA = "Mozilla/5.0 (personal ticket alert)"
 
-# Lines the organiser edits when a release changes, e.g. "Release 1 is on sale now."
-SIGNAL = re.compile(
+RELEASE = re.compile(
     r"(release\s*\d+[^.<\n]{0,80}"
-    r"|(?:tickets?\s+(?:are\s+)?)?sold\s*out[^.<\n]{0,60}"
+    r"|sold\s*out[^.<\n]{0,60}"
     r"|on\s+sale\s+(?:from|soon|on)[^.<\n]{0,60}"
-    r"|waiting\s*list[^.<\n]{0,60}"
-    r"|no\s+tickets?\s+(?:are\s+)?available[^.<\n]{0,40})",
+    r"|waiting\s*list[^.<\n]{0,60})",
     re.I,
 )
 
@@ -30,11 +34,54 @@ def fetch(url):
         return r.read().decode("utf-8", "replace")
 
 
-def signature(page):
-    text = html.unescape(re.sub(r"<[^>]+>", " ", page))
-    text = re.sub(r"\s+", " ", text)
-    found = sorted({m.group(0).strip().lower() for m in SIGNAL.finditer(text)})
-    return " | ".join(found) or "none"
+def snapshot(page):
+    tickets = {}
+    for block in re.findall(r'<script[^>]*ld\+json[^>]*>(.*?)</script>', page, re.S):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if item.get("@type") != "Event":
+                continue
+            for o in item.get("offers") or []:
+                status = str(o.get("availability", "")).rsplit("/", 1)[-1] or "Unknown"
+                tickets[o.get("name", "?")] = {"status": status, "price": o.get("price")}
+    body = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", page, flags=re.S | re.I)
+    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body)))
+    release = sorted({m.group(0).strip().lower() for m in RELEASE.finditer(text)})
+    if not tickets and not release:
+        raise ValueError("page loaded but no ticket data found (layout may have changed)")
+    return {"tickets": tickets, "release": release}
+
+
+def describe(prev, cur):
+    lines, restock = [], False
+    pt, ct = prev.get("tickets", {}), cur["tickets"]
+    for name in sorted(set(pt) | set(ct)):
+        a, b = pt.get(name), ct.get(name)
+        if a == b:
+            continue
+        if a is None:
+            lines.append(f"NEW: {name} £{b['price']} ({b['status']})")
+            restock |= b["status"] == "InStock"
+        elif b is None:
+            lines.append(f"REMOVED: {name}")
+        else:
+            if a["status"] != b["status"]:
+                lines.append(f"{name}: {a['status']} -> {b['status']}")
+                restock |= b["status"] == "InStock"
+            if a["price"] != b["price"]:
+                lines.append(f"{name}: £{a['price']} -> £{b['price']}")
+    if prev.get("release") != cur["release"]:
+        lines.append("Wording now: " + (" | ".join(cur["release"]) or "none"))
+    return lines, restock
+
+
+def summary(cur):
+    t = cur["tickets"]
+    instock = sum(v["status"] == "InStock" for v in t.values())
+    return f"{instock}/{len(t)} ticket types in stock"
 
 
 def notify(title, msg, priority="urgent"):
@@ -56,23 +103,45 @@ def notify(title, msg, priority="urgent"):
     urllib.request.urlopen(req, timeout=20)
 
 
+def load():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
+
+
 def main():
     if "--test-alert" in sys.argv:
         notify("BDSA watcher test", "Tap to open the ticket page. If you see this, alerts work.", "high")
         return
+    state = load() or {}
     try:
-        current = signature(fetch(EVENT_URL))
+        cur = snapshot(fetch(EVENT_URL))
     except Exception as e:
-        print("fetch error:", e, flush=True)
+        fails = state.get("fails", 0) + 1
+        print(f"fetch error ({fails}/{FAIL_LIMIT}): {e}", flush=True)
+        state["fails"] = fails
+        save(state)
+        if fails >= FAIL_LIMIT:
+            sys.exit(f"{fails} failed checks in a row: watcher can't read the page")
         return
-    previous = STATE_FILE.read_text().strip() if STATE_FILE.exists() else None
-    print("previous:", previous, "current:", current, flush=True)
+    prev = state.get("snap")
+    print("current:", summary(cur), "|", json.dumps(cur), flush=True)
     if "--dry-run" in sys.argv:
         return
-    if previous is not None and current != previous:
-        notify("BDSA tickets: page changed", f"Now: {current}\nWas: {previous}\nTap to open.")
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(current)
+    if prev is not None:
+        lines, restock = describe(prev, cur)
+        if lines:
+            title = "BDSA TICKETS AVAILABLE" if restock else "BDSA tickets: change"
+            notify(title, "\n".join(lines) + f"\n({summary(cur)}) Tap to open.", "urgent" if restock else "high")
+    else:
+        print("first run: baseline saved, no alert", flush=True)
+    save({"snap": cur, "fails": 0})
 
 
 if __name__ == "__main__":
